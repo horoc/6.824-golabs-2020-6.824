@@ -8,7 +8,7 @@ package raft
 // test with the original before submitting.
 //
 
-import "../labrpc"
+import "github.com/horoc/6.824-golabs-2020-6.824/src/labrpc"
 import "log"
 import "sync"
 import "testing"

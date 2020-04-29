@@ -1,30 +1,10 @@
 package raft
 
-//
-// this is an outline of the API that raft must expose to
-// the service (or tester). see comments below for
-// each of these functions for more details.
-//
-// rf = Make(...)
-//   create a new Raft server.
-// rf.Start(command interface{}) (index, term, isleader)
-//   start agreement on a new log entry
-// rf.GetState() (term, isLeader)
-//   ask a Raft for its current term, and whether it thinks it is leader
-// ApplyMsg
-//   each time a new entry is committed to the log, each Raft peer
-//   should send an ApplyMsg to the service (or tester)
-//   in the same server.
-//
-
 import "sync"
 import "sync/atomic"
-import "../labrpc"
+import "github.com/horoc/6.824-golabs-2020-6.824/src/labrpc"
 
-// import "bytes"
-// import "../labgob"
-
-
+//https://github.com/maemual/raft-zh_cn/blob/master/raft-zh_cn.md 具体实现可以参考论文
 
 //
 // as each Raft peer becomes aware that successive log entries are
@@ -37,15 +17,30 @@ import "../labrpc"
 // snapshots) on the applyCh; at that point you can add fields to
 // ApplyMsg, but set CommandValid to false for these other uses.
 //
+
+//ApplyMsg实际上就是发送到状态机的信息，每个被commit的日志最后都要放到状态机里执行，状态机比如一个kv数据库
 type ApplyMsg struct {
 	CommandValid bool
 	Command      interface{}
 	CommandIndex int
 }
 
-//
-// A Go object implementing a single Raft peer.
-//
+//日志存储格式
+type LogEntry struct {
+	LogIndex int
+	LogTerm  int
+	Data     interface{}
+}
+
+type PeerState int32
+
+const (
+	LEADER    PeerState = 0
+	FOLLOWER  PeerState = 1
+	CANDIDATE PeerState = 2
+)
+
+//Raft实例数据结构
 type Raft struct {
 	mu        sync.Mutex          // Lock to protect shared access to this peer's state
 	peers     []*labrpc.ClientEnd // RPC end points of all peers
@@ -53,19 +48,76 @@ type Raft struct {
 	me        int                 // this peer's index into peers[]
 	dead      int32               // set by Kill()
 
-	// Your data here (2A, 2B, 2C).
-	// Look at the paper's Figure 2 for a description of what
-	// state a Raft server must maintain.
+	state PeerState //节点状态
+
+	//所有Server所要存储的信息
+	//1. 持久化的数据
+	currentTerm int //当前任期号
+	voteFor     int //当前获得选票的候选人id
+	log         []LogEntry
+	//2.存在内存中的数据
+	commitIndex int //最大已经被提交的日志索引号。与[]logEntry中的最大索引号不同，log数组中的元素不一定是commit的，是否commit是由leader控制的，leader会根据matchIndex数组中节点的信息来确认commitIndex值
+	//比如，各个节点的log数组的最大索引分别是（10,11,10,13,10), 那么leader就会将commitIndex拉到10，随后广播各个节点，各个节点也将commitIndex更新到10
+	lastApplied int //应用到状态机的最大索引号
+
+	//当Server成为leader后所要维护的信息（全部在内存中）
+	nextIndex  []int //对每个Server, Leader要发送给他的下一个日志索引号
+	matchIndex []int //对每个Server, 已经复制的最大日志索引号
 
 }
 
-// return currentTerm and whether this server
-// believes it is the leader.
+//Rpc数据结构
+//1. 请求投票的RPC request 和 response
+type RequestVoteArgs struct {
+	Term         int //currentTerm，会在成为候选节点时++
+	CandidateId  int //候选人的id
+	LastLogIndex int //候选人的最后日志索引id，这里指的是[]logEntry的最大值
+	LastLogTerm  int //与lastLogIndex对应
+}
+type RequestVoteReply struct {
+	Term        int  //响应节点的currentTerm，返回该值的目的是，如果响应节点有更大的currentTerm，那么请求节点要更新
+	VoteGranted bool //是否赢得投票
+	/*
+		接收者拒绝投票的逻辑：
+		1. 如果request.term < currentTerm 返回false, 并在reponse.term附上自己的currentTerm
+		2. vatedFor != null && request.candidateId != vateFor，实际上就是接收节点已经给其他candidate投票过的情况
+		3. request.lastLogIndex <  maxIndex(receiver.log) ，实际上就是接受者的最大日志索引比请求者的大
+	*/
+}
+
+//2. 新增日志RPC request 和 response
+type AppendLogRequest struct {
+	Term              int //currentTerm
+	LeaderId          int
+	PrevLogIndex      int //这里指的是leader.nextIndex[i]
+	PreLogTerm        int
+	entries           []LogEntry //准备新增的日志
+	LeaderCommitIndex int        //Leader 已经提交的最大日志索引, 实际上就是leader.commitIndex
+}
+type AppendLogResponse struct {
+	Term      int
+	Success   bool
+	NextIndex int
+	/*
+		接收者接收请求时的处理逻辑：
+		1. request.term < receiver.currentTerm 返回 currentTerm, false
+		2. request.prevLogIndex等于maxIndex(receiver.log), 但prevLogTerm 不匹配，返回 currentTerm, false
+		3. request.prevLogIndex小于maxIndex(receiver.log), 删除prevLogIndex之后所有日志
+		4. request.prevLogIndex大于maxIndex(receiver.log), 返回currentTerm, false, maxIndex(receiver.log)  --> Leader收到这个后会重试
+		4. entries为空时不做处理
+		5. request.leaderCommitIndex > receiver.commitIndex，令 commitIndex 等于 leaderCommit 和 maxIndex(receiver.log) 中较小的一个
+	*/
+}
+
+//返回 （当前term,  是否leader）
 func (rf *Raft) GetState() (int, bool) {
 
 	var term int
 	var isleader bool
-	// Your code here (2A).
+
+	term = rf.currentTerm
+	isleader = rf.state == LEADER
+
 	return term, isleader
 }
 
@@ -84,7 +136,6 @@ func (rf *Raft) persist() {
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
 }
-
 
 //
 // restore previously persisted state.
@@ -106,25 +157,6 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
-}
-
-
-
-
-//
-// example RequestVote RPC arguments structure.
-// field names must start with capital letters!
-//
-type RequestVoteArgs struct {
-	// Your data here (2A, 2B).
-}
-
-//
-// example RequestVote RPC reply structure.
-// field names must start with capital letters!
-//
-type RequestVoteReply struct {
-	// Your data here (2A).
 }
 
 //
@@ -168,7 +200,6 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	return ok
 }
 
-
 //
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
@@ -189,7 +220,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 
 	// Your code here (2B).
-
 
 	return index, term, isLeader
 }
@@ -237,7 +267,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
-
 
 	return rf
 }
