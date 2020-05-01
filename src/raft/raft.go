@@ -53,7 +53,7 @@ const (
 	RPCTimeout       = time.Millisecond * 50
 )
 
-const RPCRetryTimes = 3
+const RPCRetryTimes = 1
 
 //Raft实例数据结构
 type Raft struct {
@@ -236,8 +236,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 }
 
-//func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 func (rf *Raft) AppendEntries(args *AppendLogRequest, reply *AppendLogResponse) {
+	fmt.Printf("%d received hearbeat from %d , current term %d, current state%d \n", rf.me, args.LeaderId, rf.currentTerm, rf.state)
+
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
@@ -252,7 +253,7 @@ func (rf *Raft) AppendEntries(args *AppendLogRequest, reply *AppendLogResponse) 
 	rf.currentTerm = args.Term
 	rf.state = FOLLOWER
 	rf.resetElectionTimer()
-	fmt.Printf("%d received hearbeat from %d , current state term %d \n", rf.me, args.LeaderId, rf.currentTerm)
+	rf.persist()
 	//todo
 }
 
@@ -366,10 +367,10 @@ func (rf *Raft) startElection() {
 			continue
 		}
 
-		go func() {
+		go func(ch chan bool, index int) {
 			reply := &RequestVoteReply{}
-			rf.sendRequestVote(i, &voteRequest, reply)
-			voteCh <- reply.VoteGranted
+			rf.sendRequestVote(index, &voteRequest, reply)
+			ch <- reply.VoteGranted
 			if reply.Term > rf.currentTerm {
 				rf.mu.Lock()
 				rf.currentTerm = reply.Term
@@ -379,40 +380,40 @@ func (rf *Raft) startElection() {
 				rf.mu.Unlock()
 				return
 			}
-		}()
+		}(voteCh, i)
+	}
 
-		for {
-			voteRes := <-voteCh
-			voteCount = voteCount + 1
-			if voteRes == true {
-				voteGrantedCount = voteGrantedCount + 1
-			}
-
-			if voteGrantedCount > len(rf.peers)/2 {
-				//因为中间发rpc的部分没加锁, double check
-				if rf.currentTerm == voteRequest.Term && rf.state == CANDIDATE {
-					rf.mu.Lock()
-					rf.state = LEADER
-					rf.initLeader()
-					rf.resetElectionTimer()
-					for i, _ := range rf.peers {
-						rf.clearHeartBeatTimer(i)
-					}
-					rf.persist()
-					rf.mu.Unlock()
-				}
-				return
-			}
-
-			if voteCount == len(rf.peers) {
-				rf.mu.Lock()
-				rf.resetElectionTimer()
-				rf.state = FOLLOWER
-				rf.mu.Unlock()
-				return
-			}
-
+	for {
+		voteRes := <-voteCh
+		voteCount = voteCount + 1
+		if voteRes == true {
+			voteGrantedCount = voteGrantedCount + 1
 		}
+
+		if voteGrantedCount > len(rf.peers)/2 {
+			//因为中间发rpc的部分没加锁, double check
+			if rf.currentTerm == voteRequest.Term && rf.state == CANDIDATE {
+				rf.mu.Lock()
+				rf.state = LEADER
+				rf.initLeader()
+				rf.resetElectionTimer()
+				for i, _ := range rf.peers {
+					rf.clearHeartBeatTimer(i)
+				}
+				rf.persist()
+				rf.mu.Unlock()
+			}
+			return
+		}
+
+		if voteCount == len(rf.peers) {
+			rf.mu.Lock()
+			rf.resetElectionTimer()
+			rf.state = FOLLOWER
+			rf.mu.Unlock()
+			return
+		}
+
 	}
 }
 
@@ -427,9 +428,12 @@ func (rf *Raft) initLeader() {
 }
 
 func (rf *Raft) appendEntriesToPeer(index int) {
+
+	rf.resetHeartBeatTimer(index)
+
 	for i := 0; i < RPCRetryTimes; i++ {
+
 		if rf.state != LEADER {
-			rf.resetHeartBeatTimer(index)
 			return
 		}
 
@@ -455,7 +459,6 @@ func (rf *Raft) appendEntriesToPeer(index int) {
 			}
 		}
 
-		rf.resetHeartBeatTimer(index)
 		//todo
 
 		return
